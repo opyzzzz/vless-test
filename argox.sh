@@ -5,7 +5,7 @@ WORK_DIR="/etc/argox"
 mkdir -p $WORK_DIR
 cd $WORK_DIR
 
-echo "===== ArgoX LXC PRO MODE ====="
+echo "===== ArgoX LXC DualStack Edition ====="
 
 if [ "$(id -u)" != 0 ]; then
   echo "Run as root"
@@ -15,17 +15,36 @@ fi
 apt update -y
 apt install -y curl wget unzip nginx uuid-runtime
 
-# ===== 基础参数 =====
-read -p "Enter VPS IP: " SERVER_IP
+# ===============================
+# 选择 IPv4 或 IPv6（参考 suoha）
+# ===============================
+
+read -p "请选择 Argo 连接模式 IPv4 或 IPv6 (输入 4 或 6，默认 4): " IPS
+IPS=${IPS:-4}
+
+if [[ "$IPS" != "4" && "$IPS" != "6" ]]; then
+  echo "请输入正确的模式 (4 或 6)"
+  exit 1
+fi
+
+echo "使用 IPv$IPS 连接 Cloudflare"
+
+# ===============================
+# 基本参数
+# ===============================
+
 read -p "Enter Argo Domain: " ARGO_DOMAIN
 read -p "Enter Argo Token or Json: " ARGO_AUTH
 read -p "Enter Node Name: " NODE_NAME
 
-REALITY_PORT=$(shuf -i 10000-60000 -n 1)
 UUID=$(cat /proc/sys/kernel/random/uuid)
 WS_PATH=$(echo $UUID | cut -d- -f1)
+PORT=$((RANDOM%20000+10000))
 
-# ===== 下载组件（串行）=====
+# ===============================
+# 下载组件（串行）
+# ===============================
+
 echo "Downloading Xray..."
 wget -q -O Xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
 unzip -oq Xray.zip
@@ -38,11 +57,14 @@ wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest
 chmod +x cloudflared
 sleep 2
 
-# ===== 生成 Xray 配置 =====
+# ===============================
+# 生成 Xray 配置
+# ===============================
+
 cat > config.json <<EOF
 {
   "inbounds": [{
-    "port": $REALITY_PORT,
+    "port": $PORT,
     "listen": "127.0.0.1",
     "protocol": "vless",
     "settings": {
@@ -54,15 +76,19 @@ cat > config.json <<EOF
       "wsSettings": { "path": "/$WS_PATH" }
     }
   }],
-  "outbounds": [{ "protocol": "freedom" }]
+  "outbounds": [{
+    "protocol": "freedom"
+  }]
 }
 EOF
 
-# ===== nginx 独立配置（不依赖 systemctl）=====
-cat > nginx.conf <<EOF
-worker_processes  1;
+# ===============================
+# 独立 nginx（不使用 systemctl）
+# ===============================
 
-events { worker_connections  1024; }
+cat > nginx.conf <<EOF
+worker_processes 1;
+events { worker_connections 1024; }
 
 http {
   server {
@@ -70,7 +96,7 @@ http {
     server_name $ARGO_DOMAIN;
 
     location /$WS_PATH {
-      proxy_pass http://127.0.0.1:$REALITY_PORT;
+      proxy_pass http://127.0.0.1:$PORT;
       proxy_http_version 1.1;
       proxy_set_header Upgrade \$http_upgrade;
       proxy_set_header Connection "upgrade";
@@ -86,20 +112,39 @@ sleep 1
 /usr/sbin/nginx -c $WORK_DIR/nginx.conf
 sleep 2
 
-# ===== 启动 Xray =====
+# ===============================
+# 启动 Xray
+# ===============================
+
+echo "Starting Xray..."
 nohup $WORK_DIR/xray run -config $WORK_DIR/config.json > xray.log 2>&1 &
 echo $! > xray.pid
 sleep 3
 
-# ===== 启动 Argo =====
-nohup $WORK_DIR/cloudflared tunnel --no-autoupdate run --token "$ARGO_AUTH" > argo.log 2>&1 &
+# ===============================
+# 启动 Argo（关键：--edge-ip-version）
+# ===============================
+
+echo "Starting Cloudflare Tunnel..."
+nohup $WORK_DIR/cloudflared \
+  --edge-ip-version $IPS \
+  --protocol http2 \
+  tunnel --no-autoupdate run --token "$ARGO_AUTH" \
+  > argo.log 2>&1 &
+
 echo $! > argo.pid
 sleep 3
 
-# ===== 守护机制（参考 suoha Alpine 模式）=====
+# ===============================
+# 守护机制（参考 suoha）
+# ===============================
+
 cat > monitor.sh <<EOF
 #!/usr/bin/env bash
 WORK_DIR="$WORK_DIR"
+IPS="$IPS"
+TOKEN="$ARGO_AUTH"
+
 while true
 do
   if ! ps -p \$(cat \$WORK_DIR/xray.pid 2>/dev/null) > /dev/null 2>&1; then
@@ -108,7 +153,11 @@ do
   fi
 
   if ! ps -p \$(cat \$WORK_DIR/argo.pid 2>/dev/null) > /dev/null 2>&1; then
-    nohup \$WORK_DIR/cloudflared tunnel --no-autoupdate run --token "$ARGO_AUTH" > argo.log 2>&1 &
+    nohup \$WORK_DIR/cloudflared \
+      --edge-ip-version \$IPS \
+      --protocol http2 \
+      tunnel --no-autoupdate run --token "\$TOKEN" \
+      > argo.log 2>&1 &
     echo \$! > \$WORK_DIR/argo.pid
   fi
 
@@ -120,20 +169,23 @@ chmod +x monitor.sh
 nohup ./monitor.sh > monitor.log 2>&1 &
 echo $! > monitor.pid
 
-# ===== 管理脚本 =====
+# ===============================
+# 管理脚本（类似 suoha 菜单）
+# ===============================
+
 cat > /usr/bin/argox <<EOF
 #!/usr/bin/env bash
 WORK_DIR="$WORK_DIR"
 
 while true
 do
-echo "1. Status"
-echo "2. Restart"
-echo "3. Stop"
-echo "4. Start"
-echo "5. Uninstall"
-echo "0. Exit"
-read -p "Select: " menu
+echo "1. 状态"
+echo "2. 重启"
+echo "3. 停止"
+echo "4. 启动"
+echo "5. 卸载"
+echo "0. 退出"
+read -p "请选择: " menu
 
 case \$menu in
 1)
@@ -145,9 +197,7 @@ case \$menu in
   pkill cloudflared
   sleep 2
   nohup \$WORK_DIR/xray run -config \$WORK_DIR/config.json > xray.log 2>&1 &
-  echo \$! > \$WORK_DIR/xray.pid
-  nohup \$WORK_DIR/cloudflared tunnel --no-autoupdate run --token "$ARGO_AUTH" > argo.log 2>&1 &
-  echo \$! > \$WORK_DIR/argo.pid
+  nohup \$WORK_DIR/cloudflared tunnel run --token "$ARGO_AUTH" > argo.log 2>&1 &
   ;;
 3)
   pkill xray
@@ -155,9 +205,7 @@ case \$menu in
   ;;
 4)
   nohup \$WORK_DIR/xray run -config \$WORK_DIR/config.json > xray.log 2>&1 &
-  echo \$! > \$WORK_DIR/xray.pid
-  nohup \$WORK_DIR/cloudflared tunnel --no-autoupdate run --token "$ARGO_AUTH" > argo.log 2>&1 &
-  echo \$! > \$WORK_DIR/argo.pid
+  nohup \$WORK_DIR/cloudflared tunnel run --token "$ARGO_AUTH" > argo.log 2>&1 &
   ;;
 5)
   pkill xray
@@ -178,10 +226,9 @@ chmod +x /usr/bin/argox
 
 echo ""
 echo "===== INSTALL COMPLETE ====="
-echo "Node Name: $NODE_NAME"
+echo "IPv$IPS 模式"
 echo "UUID: $UUID"
 echo "WS Path: /$WS_PATH"
-echo "Domain: $ARGO_DOMAIN"
 echo ""
 echo "VLESS:"
 echo "vless://$UUID@$ARGO_DOMAIN:443?encryption=none&security=tls&type=ws&host=$ARGO_DOMAIN&path=/$WS_PATH#$NODE_NAME"
