@@ -1,235 +1,169 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/bash
 
-WORK_DIR="/etc/argox"
-mkdir -p $WORK_DIR
-cd $WORK_DIR
-
-echo "===== ArgoX LXC DualStack Edition ====="
+clear
+echo "ArgoX + Suoha + Nginx 增强版"
+echo
 
 if [ "$(id -u)" != 0 ]; then
-  echo "Run as root"
+  echo "请用 root 运行"
   exit 1
 fi
+
+mkdir -p /opt/suoha
+cd /opt/suoha || exit
+
+# 架构检测
+case $(uname -m) in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  armv7l) ARCH=arm ;;
+  *) echo "架构不支持"; exit ;;
+esac
 
 apt update -y
-apt install -y curl wget unzip nginx uuid-runtime
+apt install -y wget unzip curl nginx
 
-# ===============================
-# 选择 IPv4 或 IPv6（参考 suoha）
-# ===============================
+# 下载 Xray
+wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$ARCH.zip -O xray.zip
+unzip -qo xray.zip
+mv xray /opt/suoha/
+chmod +x /opt/suoha/xray
+rm -rf xray.zip geo*
 
-read -p "请选择 Argo 连接模式 IPv4 或 IPv6 (输入 4 或 6，默认 4): " IPS
-IPS=${IPS:-4}
+# 下载 Cloudflared
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH -O cloudflared
+chmod +x cloudflared
+mv cloudflared /opt/suoha/
 
-if [[ "$IPS" != "4" && "$IPS" != "6" ]]; then
-  echo "请输入正确的模式 (4 或 6)"
-  exit 1
-fi
-
-echo "使用 IPv$IPS 连接 Cloudflare"
-
-# ===============================
-# 基本参数
-# ===============================
-
-read -p "Enter Argo Domain: " ARGO_DOMAIN
-read -p "Enter Argo Token or Json: " ARGO_AUTH
-read -p "Enter Node Name: " NODE_NAME
+# 协议选择
+read -p "1.vmess 2.vless (默认2): " protocol
+[ -z "$protocol" ] && protocol=2
 
 UUID=$(cat /proc/sys/kernel/random/uuid)
-WS_PATH=$(echo $UUID | cut -d- -f1)
-PORT=$((RANDOM%20000+10000))
+PORT=10000
+WSPATH=$(echo $UUID | cut -d '-' -f1)
 
-# ===============================
-# 下载组件（串行）
-# ===============================
-
-echo "Downloading Xray..."
-wget -q -O Xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-unzip -oq Xray.zip
-chmod +x xray
-rm -f Xray.zip
-sleep 2
-
-echo "Downloading cloudflared..."
-wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-chmod +x cloudflared
-sleep 2
-
-# ===============================
 # 生成 Xray 配置
-# ===============================
+if [ "$protocol" == "1" ]; then
+PROTO="vmess"
+else
+PROTO="vless"
+fi
 
-cat > config.json <<EOF
+cat >/opt/suoha/config.json<<EOF
 {
-  "inbounds": [{
-    "port": $PORT,
-    "listen": "127.0.0.1",
-    "protocol": "vless",
-    "settings": {
-      "decryption": "none",
-      "clients": [{ "id": "$UUID" }]
-    },
-    "streamSettings": {
-      "network": "ws",
-      "wsSettings": { "path": "/$WS_PATH" }
+  "inbounds":[
+    {
+      "port":$PORT,
+      "listen":"127.0.0.1",
+      "protocol":"$PROTO",
+      "settings":{
+        "decryption":"none",
+        "clients":[{"id":"$UUID"}]
+      },
+      "streamSettings":{
+        "network":"ws",
+        "wsSettings":{"path":"/$WSPATH"}
+      }
     }
-  }],
-  "outbounds": [{
-    "protocol": "freedom"
-  }]
+  ],
+  "outbounds":[{"protocol":"freedom"}]
 }
 EOF
 
-# ===============================
-# 独立 nginx（不使用 systemctl）
-# ===============================
+# Nginx 反代
+mkdir -p /var/www/html
+echo "<h1>Welcome</h1>" >/var/www/html/index.html
 
-cat > nginx.conf <<EOF
-worker_processes 1;
-events { worker_connections 1024; }
-
-http {
-  server {
+cat >/etc/nginx/sites-available/suoha<<EOF
+server {
     listen 80;
-    server_name $ARGO_DOMAIN;
+    server_name _;
 
-    location /$WS_PATH {
-      proxy_pass http://127.0.0.1:$PORT;
-      proxy_http_version 1.1;
-      proxy_set_header Upgrade \$http_upgrade;
-      proxy_set_header Connection "upgrade";
-      proxy_set_header Host \$host;
+    location /$WSPATH {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
     }
-  }
+
+    location / {
+        root /var/www/html;
+        index index.html;
+    }
 }
 EOF
 
-mkdir -p /run
-pkill nginx 2>/dev/null || true
-sleep 1
-/usr/sbin/nginx -c $WORK_DIR/nginx.conf
-sleep 2
+ln -sf /etc/nginx/sites-available/suoha /etc/nginx/sites-enabled/
+nginx -t && systemctl restart nginx
 
-# ===============================
-# 启动 Xray
-# ===============================
+# 启动 Argo
+nohup /opt/suoha/cloudflared tunnel --url http://localhost:80 >argo.log 2>&1 &
+sleep 5
+DOMAIN=$(grep trycloudflare argo.log | sed -n 's/.*https:\/\///p' | head -1)
 
-echo "Starting Xray..."
-nohup $WORK_DIR/xray run -config $WORK_DIR/config.json > xray.log 2>&1 &
-echo $! > xray.pid
-sleep 3
+# 优选域名设置
+read -p "请输入优选域名(可留空): " BESTDOMAIN
 
-# ===============================
-# 启动 Argo（关键：--edge-ip-version）
-# ===============================
+if [ -n "$BESTDOMAIN" ]; then
+  DOMAIN=$BESTDOMAIN
+fi
 
-echo "Starting Cloudflare Tunnel..."
-nohup $WORK_DIR/cloudflared \
-  --edge-ip-version $IPS \
-  --protocol http2 \
-  tunnel --no-autoupdate run --token "$ARGO_AUTH" \
-  > argo.log 2>&1 &
+# 生成节点
+if [ "$PROTO" == "vmess" ]; then
+LINK="vmess://$(echo -n "{\"v\":\"2\",\"ps\":\"argo\",\"add\":\"$DOMAIN\",\"port\":\"443\",\"id\":\"$UUID\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"$DOMAIN\",\"path\":\"/$WSPATH\",\"tls\":\"tls\"}" | base64 -w 0)"
+else
+LINK="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=/$WSPATH#argo"
+fi
 
-echo $! > argo.pid
-sleep 3
+echo "$LINK" >/opt/suoha/v2ray.txt
 
-# ===============================
-# 守护机制（参考 suoha）
-# ===============================
+# systemd
+cat >/lib/systemd/system/xray.service<<EOF
+[Unit]
+Description=Xray Service
+After=network.target
 
-cat > monitor.sh <<EOF
-#!/usr/bin/env bash
-WORK_DIR="$WORK_DIR"
-IPS="$IPS"
-TOKEN="$ARGO_AUTH"
+[Service]
+ExecStart=/opt/suoha/xray run -config /opt/suoha/config.json
+Restart=always
 
-while true
-do
-  if ! ps -p \$(cat \$WORK_DIR/xray.pid 2>/dev/null) > /dev/null 2>&1; then
-    nohup \$WORK_DIR/xray run -config \$WORK_DIR/config.json > xray.log 2>&1 &
-    echo \$! > \$WORK_DIR/xray.pid
-  fi
-
-  if ! ps -p \$(cat \$WORK_DIR/argo.pid 2>/dev/null) > /dev/null 2>&1; then
-    nohup \$WORK_DIR/cloudflared \
-      --edge-ip-version \$IPS \
-      --protocol http2 \
-      tunnel --no-autoupdate run --token "\$TOKEN" \
-      > argo.log 2>&1 &
-    echo \$! > \$WORK_DIR/argo.pid
-  fi
-
-  sleep 20
-done
+[Install]
+WantedBy=multi-user.target
 EOF
 
-chmod +x monitor.sh
-nohup ./monitor.sh > monitor.log 2>&1 &
-echo $! > monitor.pid
+systemctl daemon-reload
+systemctl enable xray
+systemctl restart xray
 
-# ===============================
-# 管理脚本（类似 suoha 菜单）
-# ===============================
-
-cat > /usr/bin/argox <<EOF
-#!/usr/bin/env bash
-WORK_DIR="$WORK_DIR"
-
-while true
-do
-echo "1. 状态"
-echo "2. 重启"
-echo "3. 停止"
-echo "4. 启动"
-echo "5. 卸载"
-echo "0. 退出"
-read -p "请选择: " menu
-
-case \$menu in
-1)
-  ps aux | grep xray | grep -v grep
-  ps aux | grep cloudflared | grep -v grep
-  ;;
-2)
-  pkill xray
-  pkill cloudflared
-  sleep 2
-  nohup \$WORK_DIR/xray run -config \$WORK_DIR/config.json > xray.log 2>&1 &
-  nohup \$WORK_DIR/cloudflared tunnel run --token "$ARGO_AUTH" > argo.log 2>&1 &
-  ;;
-3)
-  pkill xray
-  pkill cloudflared
-  ;;
-4)
-  nohup \$WORK_DIR/xray run -config \$WORK_DIR/config.json > xray.log 2>&1 &
-  nohup \$WORK_DIR/cloudflared tunnel run --token "$ARGO_AUTH" > argo.log 2>&1 &
-  ;;
+# 管理命令
+cat >/usr/bin/suoha<<EOF
+#!/bin/bash
+echo "1. 启动"
+echo "2. 停止"
+echo "3. 重启"
+echo "4. 查看节点"
+echo "5. 修改优选域名"
+read -p "选择: " m
+case \$m in
+1) systemctl start xray nginx ;;
+2) systemctl stop xray nginx ;;
+3) systemctl restart xray nginx ;;
+4) cat /opt/suoha/v2ray.txt ;;
 5)
-  pkill xray
-  pkill cloudflared
-  pkill nginx
-  rm -rf \$WORK_DIR /usr/bin/argox
-  echo "Uninstalled"
-  exit
-  ;;
-0)
-  exit
-  ;;
+ read -p "输入新优选域名: " NEWDOMAIN
+ sed -i "s/@.*:443/@\$NEWDOMAIN:443/" /opt/suoha/v2ray.txt
+ echo "修改完成"
+ ;;
 esac
-done
 EOF
 
-chmod +x /usr/bin/argox
+chmod +x /usr/bin/suoha
 
-echo ""
-echo "===== INSTALL COMPLETE ====="
-echo "IPv$IPS 模式"
-echo "UUID: $UUID"
-echo "WS Path: /$WS_PATH"
-echo ""
-echo "VLESS:"
-echo "vless://$UUID@$ARGO_DOMAIN:443?encryption=none&security=tls&type=ws&host=$ARGO_DOMAIN&path=/$WS_PATH#$NODE_NAME"
-echo ""
+echo
+echo "安装完成"
+cat /opt/suoha/v2ray.txt
+echo
+echo "管理命令: suoha"
