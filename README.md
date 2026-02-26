@@ -8,3 +8,7 @@ argox
 ```
 bash <(wget -qO- https://raw.githubusercontent.com/opyzzzz/vless-test/refs/heads/main/argox.sh)
 ```
+suoha
+```
+curl https://raw.githubusercontent.com/opyzzzz/vless-test/refs/heads/main/suoha.sh -o suoha.sh && bash suoha.sh
+```
