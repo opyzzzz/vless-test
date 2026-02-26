@@ -2,278 +2,291 @@
 set -e
 set -o pipefail
 
-VERSION="2.7-自动清理+智能切换版"
+VERSION="3.2-自动递增+协议选择+自动清理版"
 
 BASE_DIR="/opt/suoha"
 BIN_DIR="$BASE_DIR/bin"
 CONF_DIR="$BASE_DIR/config"
+TUNNEL_DIR="$CONF_DIR/tunnels"
 SYSTEMD_DIR="/etc/systemd/system"
-CF_PREFERRED_DOMAIN="cloudflare.182682.xyz"
+DOMAIN="cloudflare.182682.xyz"
 ARCH=$(uname -m)
 
-#####################################
+########################################
 检测系统() {
     source /etc/os-release
-    OS=$ID
-
-    case "$OS" in
-        debian|ubuntu)
-            PM_INSTALL="apt install -y"
-            PM_UPDATE="apt update -y"
-            SERVICE_TYPE="systemd"
-        ;;
-        centos|rocky|almalinux)
-            if command -v dnf >/dev/null 2>&1; then
-                PM_INSTALL="dnf install -y"
-                PM_UPDATE="dnf makecache"
-            else
-                PM_INSTALL="yum install -y"
-                PM_UPDATE="yum makecache"
-            fi
-            SERVICE_TYPE="systemd"
-        ;;
-        alpine)
-            PM_INSTALL="apk add --no-cache"
-            PM_UPDATE="apk update"
-            SERVICE_TYPE="openrc"
-        ;;
-        *)
-            echo "不支持的系统: $OS"
-            exit 1
-        ;;
+    case "$ID" in
+        debian|ubuntu) PM_INSTALL="apt install -y"; PM_UPDATE="apt update -y" ;;
+        centos|rocky|almalinux) PM_INSTALL="dnf install -y"; PM_UPDATE="dnf makecache" ;;
+        *) echo "不支持系统"; exit 1 ;;
     esac
 }
 
-#####################################
+########################################
 检测架构() {
     case "$ARCH" in
         x86_64|amd64) echo "64" ;;
         aarch64|arm64) echo "arm64-v8a" ;;
-        *) echo "不支持的CPU架构"; exit 1 ;;
+        *) echo "不支持架构"; exit 1 ;;
     esac
 }
 
-#####################################
-检测IP协议() {
-    curl -4 -s --max-time 3 https://speed.cloudflare.com/meta >/dev/null && IPV4=1 || IPV4=0
-    curl -6 -s --max-time 3 https://speed.cloudflare.com/meta >/dev/null && IPV6=1 || IPV6=0
+########################################
+安装基础() {
 
-    if [ "$IPV4" = "0" ] && [ "$IPV6" = "0" ]; then
-        echo "IPv4 和 IPv6 均不可用"
-        exit 1
-    fi
+mkdir -p $BIN_DIR $CONF_DIR $TUNNEL_DIR
 
-    echo "选择网络协议："
-    [ "$IPV4" = "1" ] && echo "1. IPv4"
-    [ "$IPV6" = "1" ] && echo "2. IPv6"
-    read -p "选择: " IP_CHOICE
+$PM_UPDATE
+$PM_INSTALL curl unzip uuidgen 2>/dev/null || true
 
-    if [ "$IP_CHOICE" = "1" ]; then
-        EDGE_IP_VERSION=4
-    else
-        EDGE_IP_VERSION=6
-    fi
-}
-
-#####################################
-提取Token() {
-    read -p "请粘贴 Tunnel 命令或 Token: " INPUT_TOKEN
-
-    if [[ "$INPUT_TOKEN" == *"--token"* ]]; then
-        TOKEN=$(echo "$INPUT_TOKEN" | sed -E 's/.*--token[= ]+([^ ]+).*/\1/')
-    else
-        TOKEN="$INPUT_TOKEN"
-    fi
-
-    TOKEN=$(echo "$TOKEN" | tr -d '"' | tr -d "'")
-
-    if [ -z "$TOKEN" ]; then
-        echo "Token 提取失败"
-        exit 1
-    fi
-}
-
-#####################################
-清理旧服务() {
-
-echo "检测并清理旧隧道服务..."
-
-for svc in suoha-http2 suoha-quic suoha-xray; do
-    systemctl stop $svc 2>/dev/null || true
-    systemctl disable $svc 2>/dev/null || true
-    rm -f $SYSTEMD_DIR/$svc.service
-done
-
-systemctl daemon-reload 2>/dev/null || true
-}
-
-#####################################
-安装依赖() {
-    $PM_UPDATE
-    $PM_INSTALL curl unzip uuidgen 2>/dev/null || $PM_INSTALL uuid-runtime || true
-}
-
-#####################################
-安装Xray() {
-    mkdir -p $BIN_DIR
+if [ ! -f "$BIN_DIR/xray" ]; then
     ARCH_SUFFIX=$(检测架构)
     curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$ARCH_SUFFIX.zip
     unzip -o /tmp/xray.zip -d /tmp/xray
     mv /tmp/xray/xray $BIN_DIR/
     chmod +x $BIN_DIR/xray
-}
+fi
 
-#####################################
-安装Cloudflared() {
-    mkdir -p $BIN_DIR
+if [ ! -f "$BIN_DIR/cloudflared" ]; then
     curl -L -o $BIN_DIR/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
     chmod +x $BIN_DIR/cloudflared
+fi
 }
 
-#####################################
-生成UUID() { uuidgen; }
-
-生成端口() {
-    while :; do
-        PORT=$(shuf -i20000-50000 -n1)
-        ss -lnt | grep -q ":$PORT " || break
-    done
+########################################
+初始化UUID() {
+if [ ! -f "$CONF_DIR/uuid" ]; then
+    uuidgen > $CONF_DIR/uuid
+fi
+UUID=$(cat $CONF_DIR/uuid)
 }
 
-#####################################
-生成Xray配置() {
-    mkdir -p $CONF_DIR
-    生成端口
-    UUID=$(生成UUID)
-
-cat > $CONF_DIR/xray.json <<EOF
-{
-  "inbounds": [{
-    "port": $PORT,
-    "listen": "127.0.0.1",
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "$UUID" }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "grpc",
-      "grpcSettings": { "serviceName": "grpc" }
-    }
-  }],
-  "outbounds": [{ "protocol": "freedom" }]
-}
-EOF
-}
-
-#####################################
-创建服务() {
-
-MODE=$1
-
+########################################
+创建Xray服务() {
 cat > $SYSTEMD_DIR/suoha-xray.service <<EOF
 [Unit]
 Description=Suoha Xray
 After=network.target
-
 [Service]
 ExecStart=$BIN_DIR/xray run -config $CONF_DIR/xray.json
 Restart=always
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
-if [ "$MODE" = "http2" ] || [ "$MODE" = "both" ]; then
-cat > $SYSTEMD_DIR/suoha-http2.service <<EOF
-[Unit]
-Description=Suoha Tunnel HTTP2
-After=network.target
-
-[Service]
-ExecStart=$BIN_DIR/cloudflared tunnel --protocol http2 --edge-ip-version $EDGE_IP_VERSION run --token $TOKEN
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-fi
-
-if [ "$MODE" = "quic" ] || [ "$MODE" = "both" ]; then
-cat > $SYSTEMD_DIR/suoha-quic.service <<EOF
-[Unit]
-Description=Suoha Tunnel QUIC
-After=network.target
-
-[Service]
-ExecStart=$BIN_DIR/cloudflared tunnel --protocol quic --edge-ip-version $EDGE_IP_VERSION run --token $TOKEN
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-fi
-
 systemctl daemon-reload
 systemctl enable suoha-xray
-systemctl start suoha-xray
-
-[ -f "$SYSTEMD_DIR/suoha-http2.service" ] && systemctl enable suoha-http2 && systemctl start suoha-http2
-[ -f "$SYSTEMD_DIR/suoha-quic.service" ] && systemctl enable suoha-quic && systemctl start suoha-quic
+systemctl restart suoha-xray
 }
 
-#####################################
+########################################
+重写Xray配置() {
+
+UUID=$(cat $CONF_DIR/uuid)
+
+cat > $CONF_DIR/xray.json <<EOF
+{
+  "inbounds": [
+EOF
+
+FIRST=1
+for portfile in $TUNNEL_DIR/*.port; do
+    [ -f "$portfile" ] || continue
+    PORT=$(cat $portfile)
+
+    if [ $FIRST -eq 0 ]; then
+        echo "," >> $CONF_DIR/xray.json
+    fi
+    FIRST=0
+
+cat >> $CONF_DIR/xray.json <<EOT
+{
+  "port": $PORT,
+  "listen": "127.0.0.1",
+  "protocol": "vless",
+  "settings": {
+    "clients": [{ "id": "$UUID" }],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "grpc",
+    "grpcSettings": { "serviceName": "grpc" }
+  }
+}
+EOT
+
+done
+
+cat >> $CONF_DIR/xray.json <<EOF
+],
+"outbounds": [{ "protocol": "freedom" }]
+}
+EOF
+
+create_service_if_needed
+systemctl restart suoha-xray
+}
+
+########################################
+create_service_if_needed() {
+if [ ! -f "$SYSTEMD_DIR/suoha-xray.service" ]; then
+    创建Xray服务
+fi
+}
+
+########################################
+获取新编号() {
+MAX=0
+for file in $TUNNEL_DIR/*.port; do
+    [ -f "$file" ] || continue
+    ID=$(basename $file | sed 's/tunnel-//' | sed 's/.port//')
+    if [ "$ID" -gt "$MAX" ]; then
+        MAX=$ID
+    fi
+done
+echo $((MAX+1))
+}
+
+########################################
+提取Token() {
+read -p "粘贴 Tunnel 命令或 Token: " INPUT
+if [[ "$INPUT" == *"--token"* ]]; then
+    TOKEN=$(echo "$INPUT" | sed -E 's/.*--token[= ]+([^ ]+).*/\1/')
+else
+    TOKEN="$INPUT"
+fi
+TOKEN=$(echo "$TOKEN" | tr -d '"' | tr -d "'")
+}
+
+########################################
+创建隧道() {
+
+检测系统
+安装基础
+初始化UUID
+
+ID=$(获取新编号)
+PORT=$((21000 + ID))
+
+echo "新隧道编号: $ID"
+echo "$PORT" > $TUNNEL_DIR/tunnel-$ID.port
+
+提取Token
+echo "$TOKEN" > $TUNNEL_DIR/tunnel-$ID.token
+chmod 600 $TUNNEL_DIR/tunnel-$ID.token
+
+echo "选择协议:"
+echo "1. HTTP/2"
+echo "2. QUIC"
+read -p "选择: " MODE
+
+if [ "$MODE" = "1" ]; then
+    PROTO="http2"
+else
+    PROTO="quic"
+fi
+
+cat > $SYSTEMD_DIR/suoha-tunnel-$ID.service <<EOF
+[Unit]
+Description=Suoha Tunnel $ID
+After=network.target
+[Service]
+ExecStart=$BIN_DIR/cloudflared tunnel --protocol $PROTO run --token $TOKEN --url http://127.0.0.1:$PORT
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable suoha-tunnel-$ID
+systemctl start suoha-tunnel-$ID
+
+重写Xray配置
+
+echo "隧道 $ID 创建完成"
+}
+
+########################################
+删除隧道() {
+read -p "删除隧道编号: " ID
+systemctl stop suoha-tunnel-$ID 2>/dev/null || true
+systemctl disable suoha-tunnel-$ID 2>/dev/null || true
+rm -f $SYSTEMD_DIR/suoha-tunnel-$ID.service
+rm -f $TUNNEL_DIR/tunnel-$ID.*
+systemctl daemon-reload
+重写Xray配置
+echo "隧道 $ID 已删除"
+}
+
+########################################
+查看链接() {
+UUID=$(cat $CONF_DIR/uuid)
+echo ""
+echo "===== 当前所有节点 ====="
+for portfile in $TUNNEL_DIR/*.port; do
+    [ -f "$portfile" ] || continue
+    ID=$(basename $portfile | sed 's/tunnel-//' | sed 's/.port//')
+    echo "隧道 $ID:"
+    echo "vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=grpc&serviceName=grpc#$DOMAIN-$ID"
+    echo ""
+done
+}
+
+########################################
+自动清理残留() {
+for svc in $SYSTEMD_DIR/suoha-tunnel-*.service; do
+    [ -f "$svc" ] || continue
+    ID=$(basename $svc | sed 's/suoha-tunnel-//' | sed 's/.service//')
+    if [ ! -f "$TUNNEL_DIR/tunnel-$ID.port" ]; then
+        systemctl stop suoha-tunnel-$ID 2>/dev/null || true
+        systemctl disable suoha-tunnel-$ID 2>/dev/null || true
+        rm -f "$svc"
+    fi
+done
+systemctl daemon-reload
+}
+
+########################################
 完全卸载() {
-清理旧服务
+
+echo "确认完全卸载? (y/n)"
+read CONFIRM
+[ "$CONFIRM" != "y" ] && return
+
+systemctl stop suoha-xray 2>/dev/null || true
+systemctl disable suoha-xray 2>/dev/null || true
+rm -f $SYSTEMD_DIR/suoha-xray.service
+
+for svc in $SYSTEMD_DIR/suoha-tunnel-*.service; do
+    systemctl stop $(basename $svc .service) 2>/dev/null || true
+    systemctl disable $(basename $svc .service) 2>/dev/null || true
+    rm -f "$svc"
+done
+
 rm -rf $BASE_DIR
+systemctl daemon-reload
 echo "已完全卸载"
 }
 
-#####################################
-安装流程() {
-
-检测系统
-提取Token
-检测IP协议
-清理旧服务
-安装依赖
-安装Xray
-安装Cloudflared
-生成Xray配置
-
-echo "选择隧道模式："
-echo "1. 仅 HTTP/2"
-echo "2. 仅 QUIC"
-echo "3. 双隧道"
-read -p "选择: " MODE_CHOICE
-
-case $MODE_CHOICE in
-1) 创建服务 http2 ;;
-2) 创建服务 quic ;;
-3) 创建服务 both ;;
-*) echo "选择错误"; exit 1 ;;
-esac
-
-echo ""
-echo "========== 节点信息 =========="
-echo "优选域名: $CF_PREFERRED_DOMAIN"
-echo "vless://$UUID@$CF_PREFERRED_DOMAIN:443?encryption=none&security=tls&type=grpc&serviceName=grpc#$CF_PREFERRED_DOMAIN"
-echo "================================"
-}
-
-#####################################
+########################################
 菜单() {
+
+自动清理残留
+
 while true; do
 echo ""
 echo "========= SUOHA $VERSION ========="
-echo "1. 安装 / 切换模式"
-echo "2. 完全卸载"
+echo "1. 创建隧道"
+echo "2. 删除隧道"
+echo "3. 查看所有链接"
+echo "4. 完全卸载"
 echo "0. 退出"
-read -p "请选择: " NUM
+read -p "选择: " NUM
 
 case $NUM in
-1) 安装流程 ;;
-2) 完全卸载 ;;
+1) 创建隧道 ;;
+2) 删除隧道 ;;
+3) 查看链接 ;;
+4) 完全卸载 ;;
 0) exit ;;
 esac
 done
