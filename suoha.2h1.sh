@@ -2,7 +2,7 @@
 set -e
 set -o pipefail
 
-VERSION="3.2-自动递增+协议选择+自动清理版"
+VERSION="3.3-Debian稳定版"
 
 BASE_DIR="/opt/suoha"
 BIN_DIR="$BASE_DIR/bin"
@@ -10,25 +10,13 @@ CONF_DIR="$BASE_DIR/config"
 TUNNEL_DIR="$CONF_DIR/tunnels"
 SYSTEMD_DIR="/etc/systemd/system"
 DOMAIN="cloudflare.182682.xyz"
-ARCH=$(uname -m)
 
 ########################################
 检测系统() {
-    source /etc/os-release
-    case "$ID" in
-        debian|ubuntu) PM_INSTALL="apt install -y"; PM_UPDATE="apt update -y" ;;
-        centos|rocky|almalinux) PM_INSTALL="dnf install -y"; PM_UPDATE="dnf makecache" ;;
-        *) echo "不支持系统"; exit 1 ;;
-    esac
-}
-
-########################################
-检测架构() {
-    case "$ARCH" in
-        x86_64|amd64) echo "64" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        *) echo "不支持架构"; exit 1 ;;
-    esac
+    if ! grep -qi debian /etc/os-release; then
+        echo "本版本仅支持 Debian"
+        exit 1
+    fi
 }
 
 ########################################
@@ -36,12 +24,23 @@ ARCH=$(uname -m)
 
 mkdir -p $BIN_DIR $CONF_DIR $TUNNEL_DIR
 
-$PM_UPDATE
-$PM_INSTALL curl unzip uuidgen 2>/dev/null || true
+apt update -y
+
+apt install -y curl unzip >/dev/null 2>&1
+
+if ! command -v uuidgen >/dev/null 2>&1; then
+    apt install -y uuid-runtime >/dev/null 2>&1
+fi
 
 if [ ! -f "$BIN_DIR/xray" ]; then
-    ARCH_SUFFIX=$(检测架构)
-    curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$ARCH_SUFFIX.zip
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "x86_64" ]; then
+        FILE="Xray-linux-64.zip"
+    else
+        FILE="Xray-linux-arm64-v8a.zip"
+    fi
+
+    curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/$FILE
     unzip -o /tmp/xray.zip -d /tmp/xray
     mv /tmp/xray/xray $BIN_DIR/
     chmod +x $BIN_DIR/xray
@@ -73,9 +72,9 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
+
 systemctl daemon-reload
 systemctl enable suoha-xray
-systemctl restart suoha-xray
 }
 
 ########################################
@@ -113,7 +112,6 @@ cat >> $CONF_DIR/xray.json <<EOT
   }
 }
 EOT
-
 done
 
 cat >> $CONF_DIR/xray.json <<EOF
@@ -122,15 +120,11 @@ cat >> $CONF_DIR/xray.json <<EOF
 }
 EOF
 
-create_service_if_needed
-systemctl restart suoha-xray
-}
-
-########################################
-create_service_if_needed() {
 if [ ! -f "$SYSTEMD_DIR/suoha-xray.service" ]; then
     创建Xray服务
 fi
+
+systemctl restart suoha-xray
 }
 
 ########################################
@@ -139,9 +133,7 @@ MAX=0
 for file in $TUNNEL_DIR/*.port; do
     [ -f "$file" ] || continue
     ID=$(basename $file | sed 's/tunnel-//' | sed 's/.port//')
-    if [ "$ID" -gt "$MAX" ]; then
-        MAX=$ID
-    fi
+    [ "$ID" -gt "$MAX" ] && MAX=$ID
 done
 echo $((MAX+1))
 }
@@ -168,6 +160,7 @@ ID=$(获取新编号)
 PORT=$((21000 + ID))
 
 echo "新隧道编号: $ID"
+
 echo "$PORT" > $TUNNEL_DIR/tunnel-$ID.port
 
 提取Token
@@ -206,43 +199,15 @@ echo "隧道 $ID 创建完成"
 }
 
 ########################################
-删除隧道() {
-read -p "删除隧道编号: " ID
-systemctl stop suoha-tunnel-$ID 2>/dev/null || true
-systemctl disable suoha-tunnel-$ID 2>/dev/null || true
-rm -f $SYSTEMD_DIR/suoha-tunnel-$ID.service
-rm -f $TUNNEL_DIR/tunnel-$ID.*
-systemctl daemon-reload
-重写Xray配置
-echo "隧道 $ID 已删除"
-}
-
-########################################
 查看链接() {
 UUID=$(cat $CONF_DIR/uuid)
 echo ""
-echo "===== 当前所有节点 ====="
+echo "===== 当前节点 ====="
 for portfile in $TUNNEL_DIR/*.port; do
     [ -f "$portfile" ] || continue
     ID=$(basename $portfile | sed 's/tunnel-//' | sed 's/.port//')
-    echo "隧道 $ID:"
     echo "vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=grpc&serviceName=grpc#$DOMAIN-$ID"
-    echo ""
 done
-}
-
-########################################
-自动清理残留() {
-for svc in $SYSTEMD_DIR/suoha-tunnel-*.service; do
-    [ -f "$svc" ] || continue
-    ID=$(basename $svc | sed 's/suoha-tunnel-//' | sed 's/.service//')
-    if [ ! -f "$TUNNEL_DIR/tunnel-$ID.port" ]; then
-        systemctl stop suoha-tunnel-$ID 2>/dev/null || true
-        systemctl disable suoha-tunnel-$ID 2>/dev/null || true
-        rm -f "$svc"
-    fi
-done
-systemctl daemon-reload
 }
 
 ########################################
@@ -257,6 +222,7 @@ systemctl disable suoha-xray 2>/dev/null || true
 rm -f $SYSTEMD_DIR/suoha-xray.service
 
 for svc in $SYSTEMD_DIR/suoha-tunnel-*.service; do
+    [ -f "$svc" ] || continue
     systemctl stop $(basename $svc .service) 2>/dev/null || true
     systemctl disable $(basename $svc .service) 2>/dev/null || true
     rm -f "$svc"
@@ -269,24 +235,19 @@ echo "已完全卸载"
 
 ########################################
 菜单() {
-
-自动清理残留
-
 while true; do
 echo ""
 echo "========= SUOHA $VERSION ========="
 echo "1. 创建隧道"
-echo "2. 删除隧道"
-echo "3. 查看所有链接"
-echo "4. 完全卸载"
+echo "2. 查看所有链接"
+echo "3. 完全卸载"
 echo "0. 退出"
 read -p "选择: " NUM
 
 case $NUM in
 1) 创建隧道 ;;
-2) 删除隧道 ;;
-3) 查看链接 ;;
-4) 完全卸载 ;;
+2) 查看链接 ;;
+3) 完全卸载 ;;
 0) exit ;;
 esac
 done
